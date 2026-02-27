@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 
 // ─── LoRa Airtime Formula (Semtech AN1200.13) ──────────────────────────────
 function calcAirtime({ sf, bw, preamble, payloadBytes, cr, crc, explicitHeader, lowDROptimize }) {
@@ -32,35 +32,118 @@ const PRESETS = {
   heartbeat: {
     label: "Sensor Heartbeat",
     desc: "Node alive · battery voltage · temperature",
-    sf: 12, bw: 125, payload: 12, cr: 2, txPower_eu: 14, txPower_us: 20,
+    // EU: SF12 (max range). US: SF7/BW125 (45 ms — well within 400 ms dwell limit)
+    sf_eu: 12, sf_us: 7, bw_eu: 125, bw_us: 125,
+    payload: 12, cr: 2, txPower_eu: 14, txPower_us: 14,
   },
   status: {
     label: "Status Report",
     desc: "RPi diagnostics · sensor health metrics",
-    sf: 12, bw: 125, payload: 24, cr: 2, txPower_eu: 14, txPower_us: 20,
+    // EU: SF12. US: SF7/BW125 (70 ms — compliant)
+    sf_eu: 12, sf_us: 7, bw_eu: 125, bw_us: 125,
+    payload: 24, cr: 2, txPower_eu: 14, txPower_us: 14,
   },
   detection: {
     label: "Detection Event",
     desc: "Seismic trigger · node ID + timestamp + amplitude",
-    sf: 12, bw: 125, payload: 8, cr: 2, txPower_eu: 14, txPower_us: 20,
+    // EU: SF12. US: SF7/BW125 (39 ms — compliant)
+    sf_eu: 12, sf_us: 7, bw_eu: 125, bw_us: 125,
+    payload: 8, cr: 2, txPower_eu: 14, txPower_us: 14,
   },
   ping: {
     label: "Alive Ping",
     desc: "Minimal keepalive · lowest power",
-    sf: 12, bw: 125, payload: 6, cr: 2, txPower_eu: 14, txPower_us: 20,
+    // EU: SF12. US: SF7/BW125 (39 ms — compliant)
+    sf_eu: 12, sf_us: 7, bw_eu: 125, bw_us: 125,
+    payload: 6, cr: 2, txPower_eu: 14, txPower_us: 14,
   },
-  custom: { label: "Custom", sf: 12, bw: 125, payload: 12, cr: 2, txPower_eu: 14, txPower_us: 20 },
+  custom: { label: "Custom", sf_eu: 12, sf_us: 7, bw_eu: 125, bw_us: 125, payload: 12, cr: 2, txPower_eu: 14, txPower_us: 14 },
 };
 
 // ─── EU Sub-bands ──────────────────────────────────────────────────────────
+// ─── EU sub-bands (g and g1 combined — identical duty/BW rules) ───────────
 const EU_BANDS = [
-  { id: "g",  label: "g  868.0–868.6 MHz",  duty: 1   },
-  { id: "g1", label: "g1 863.0–868.0 MHz",  duty: 1   },
-  { id: "g2", label: "g2 868.7–869.2 MHz",  duty: 0.1 },
-  { id: "g3", label: "g3 869.4–869.65 MHz", duty: 10  },
+  { id: "g",  label: "g/g1  863.0–868.6 MHz", duty: 1   },
+  { id: "g2", label: "g2    868.7–869.2 MHz",  duty: 0.1 },
+  { id: "g3", label: "g3    869.4–869.65 MHz", duty: 10  },
 ];
 
 const fmt = (n, d = 2) => Number(n.toFixed(d)).toLocaleString();
+
+// ─── Configuration Optimizer ──────────────────────────────────────────────
+// Iterates all SF/BW/CR/TX-power combinations (and EU sub-bands).
+// Primary sort: re-arm time (EU) or ToA (US) — compliance/capacity metric.
+// Tiebreaker: energy per TX — among equal compliance, lower power wins.
+function runOptimizer({ payloadBytes, region, txInterval_min }) {
+  const results = [];
+  const bws = [125, 250, 500];
+  const bands = region === "eu" ? EU_BANDS : [null];
+  const VOLTAGE = 3.7; // fixed for energy comparison
+
+  for (const band of bands) {
+    for (let sf = 7; sf <= 12; sf++) {
+      for (const bw of bws) {
+        for (let cr = 2; cr <= 5; cr++) {
+
+          // ── EU sub-band BW physical constraints ───────────────────────
+          if (region === "eu") {
+            if (band.id === "g3" && bw >= 250) continue;
+            if (band.id === "g2" && bw === 500) continue;
+          }
+
+          const tSym = Math.pow(2, sf) / (bw * 1000) * 1000;
+          const de = tSym > 16 ? 1 : 0;
+          const toa = calcAirtime({
+            sf, bw: bw * 1000, preamble: 8, payloadBytes, cr,
+            crc: true, explicitHeader: true, lowDROptimize: de === 1,
+          });
+
+          // ── Compliance filter ─────────────────────────────────────────
+          if (region === "us") {
+            if (toa > 400) continue;
+          } else {
+            const duty_used_pct = (toa / 1000 / 60 / txInterval_min) * 100;
+            if (duty_used_pct > band.duty) continue;
+          }
+
+          const rearm_s = region === "eu" ? toa / (band.duty / 100) / 1000 : null;
+
+          // ── Iterate TX power — find minimum energy for this SF/BW/CR ──
+          // EU: max 14 dBm (EIRP limit). US: all options allowed.
+          const maxPower = region === "eu" ? 14 : 20;
+          for (const pwr of TX_POWER_OPTIONS.filter(p => p <= maxPower)) {
+            const mA = TX_CURRENT[pwr] ?? 31;
+            const energy_mJ = (mA / 1000) * VOLTAGE * (toa / 1000) * 1000;
+            results.push({
+              sf, bw, cr, toa, rearm_s, ldro: de === 1,
+              band: band ?? null, txPower: pwr, energy_mJ,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Primary: re-arm (EU) or ToA (US). Tiebreaker: energy per TX ascending.
+  results.sort((a, b) => {
+    const primary = region === "eu"
+      ? (a.rearm_s ?? 0) - (b.rearm_s ?? 0)
+      : a.toa - b.toa;
+    if (Math.abs(primary) > 0.0001) return primary;
+    return a.energy_mJ - b.energy_mJ;
+  });
+
+  // Deduplicate: keep only the best (lowest energy) entry per SF/BW/CR/band combo
+  // so results show distinct radio configs, not same config at different TX powers
+  const seen = new Set();
+  const deduped = [];
+  for (const r of results) {
+    const key = `${r.sf}-${r.bw}-${r.cr}-${r.band?.id ?? "us"}`;
+    if (!seen.has(key)) { seen.add(key); deduped.push(r); }
+    if (deduped.length === 5) break;
+  }
+  return deduped;
+}
 
 export default function App() {
   const [region, setRegion] = useState("eu");
@@ -75,7 +158,7 @@ export default function App() {
   const [txPower, setTxPower] = useState(14);
   const [voltage, setVoltage] = useState(3.7);
   const [txIntervalMin, setTxIntervalMin] = useState(15);
-  const [euBand, setEuBand] = useState("g");
+  const [euBand, setEuBand] = useState("g3");
   const [battCapacity, setBattCapacity] = useState(2000);
   const [ldrManual, setLdrManual] = useState(false);
   const [showCadNotes, setShowCadNotes] = useState(false);
@@ -84,19 +167,81 @@ export default function App() {
   const ldrRequired = tSym_ms > 16;
   const ldrOptimize = ldrRequired || ldrManual;
 
-  // Apply preset
+  // Apply preset (fires on preset change only — region switching handled by switchRegion)
   useEffect(() => {
     if (preset === "custom") return;
     const p = PRESETS[preset];
-    setSf(p.sf); setBw(p.bw); setPayload(p.payload); setCr(p.cr);
+    setSf(region === "us" ? p.sf_us : p.sf_eu);
+    setBw(region === "us" ? p.bw_us : p.bw_eu);
+    setPayload(p.payload);
+    setCr(p.cr);
     setTxPower(region === "us" ? p.txPower_us : p.txPower_eu);
-  }, [preset, region]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preset]);
 
   useEffect(() => {
     if (ldrRequired) setLdrManual(false);
   }, [ldrRequired]);
 
+  useEffect(() => {
+    setOptResults(null);
+  }, [region]);
+
   const markCustom = () => setPreset("custom");
+
+  // ── Per-region state snapshots ───────────────────────────────────────────
+  // Saves SF/BW/CR/txPower/euBand/preset when leaving a region,
+  // restores them when returning. Prevents cross-region violations.
+  const regionSnapshots = useRef({
+    eu: null,
+    us: null,
+  });
+
+  function switchRegion(newRegion) {
+    if (newRegion === region) return;
+    // Save current region state
+    regionSnapshots.current[region] = { sf, bw, cr, txPower, euBand, preset };
+    // Restore new region state if we have a snapshot, else load preset defaults
+    const snap = regionSnapshots.current[newRegion];
+    if (snap) {
+      setSf(snap.sf); setBw(snap.bw); setCr(snap.cr);
+      setTxPower(snap.txPower); setEuBand(snap.euBand);
+      setPreset(snap.preset);
+    } else {
+      // First visit to this region — load current preset's region defaults
+      const p = PRESETS[preset] ?? PRESETS.heartbeat;
+      setSf(newRegion === "us" ? p.sf_us : p.sf_eu);
+      setBw(newRegion === "us" ? p.bw_us : p.bw_eu);
+      setTxPower(newRegion === "us" ? p.txPower_us : p.txPower_eu);
+      // EU band stays at g3 default; no EU band concept for US
+    }
+    setRegion(newRegion);
+  }
+
+  // ── Optimizer state ──────────────────────────────────────────────────────
+  const [optResults, setOptResults] = useState(null);
+  const [optRunning, setOptRunning] = useState(false);
+
+  function handleOptimize() {
+    setOptRunning(true);
+    setOptResults(null);
+    setTimeout(() => {
+      const results = runOptimizer({
+        payloadBytes: payload, region,
+        txInterval_min: txIntervalMin,
+      });
+      setOptResults(results);
+      setOptRunning(false);
+    }, 20);
+  }
+
+  function applyOptResult(r) {
+    setSf(r.sf); setBw(r.bw); setCr(r.cr);
+    if (region === "eu" && r.band) setEuBand(r.band.id);
+    setTxPower(r.txPower);
+    markCustom();
+    setOptResults(null);
+  }
 
   const airtime = calcAirtime({ sf, bw: bw * 1000, preamble, payloadBytes: payload, cr, crc, explicitHeader, lowDROptimize: ldrOptimize });
   const current_mA = TX_CURRENT[txPower] ?? 31;
@@ -295,7 +440,7 @@ export default function App() {
           <div style={{ display: "flex" }}>
             {["eu", "us"].map(r => (
               <button key={r} className={`region-btn ${region === r ? "active" : ""}`}
-                onClick={() => setRegion(r)}>
+                onClick={() => switchRegion(r)}>
                 {r === "eu" ? "EU 868 MHz" : "US 915 MHz"}
               </button>
             ))}
@@ -751,6 +896,106 @@ export default function App() {
                 ))}
               </tbody>
             </table>
+          </div>
+
+          {/* Optimizer */}
+          <div className="card">
+            <div className="label">Configuration Optimizer</div>
+            <div style={{ fontSize: "11px", color: "#4a7a4a", marginBottom: "10px" }}>
+              Iterates all SF, BW, CR, TX power{region === "eu" ? ", and sub-band" : ""} combinations for a <span style={{ color: "#9fe89f" }}>{payload}-byte payload</span> in <span style={{ color: "#9fe89f" }}>{region === "eu" ? "EU 868 MHz" : "US 915 MHz"}</span>. Primary sort: {region === "eu" ? "shortest re-arm time" : "shortest ToA"}. Tiebreaker: lowest energy per TX.{region === "eu" ? ` TX interval (${txIntervalMin} min) used for duty cycle check.` : ""}
+            </div>
+            <button
+              onClick={handleOptimize}
+              style={{
+                background: "#1c5c38", border: "1px solid #4CAF50", color: "#c8f5c8",
+                padding: "8px 20px", borderRadius: "4px", cursor: "pointer",
+                fontFamily: "inherit", fontSize: "13px", letterSpacing: "0.05em",
+                width: "100%", transition: "all 0.15s",
+              }}
+            >
+              {optRunning ? "Optimizing…" : "⚡ Find Optimal Configuration"}
+            </button>
+
+            {optResults && (
+              <div style={{ marginTop: "12px" }}>
+                {optResults.length === 0 ? (
+                  <div style={{ color: "#e05050", fontSize: "12px", padding: "8px 0" }}>
+                    No compliant configuration found for this payload / interval / region combination. Try increasing TX interval or reducing payload.
+                  </div>
+                ) : (
+                  <>
+                    <div style={{ fontSize: "11px", color: "#4a7a4a", marginBottom: "6px" }}>
+                      Click a row to apply that configuration:
+                    </div>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "11px" }}>
+                      <thead>
+                        <tr style={{ borderBottom: "1px solid #2d4a30" }}>
+                          {["Rank","SF","BW","CR",
+                            region === "eu" ? "Sub-band" : "",
+                            "ToA",
+                            region === "eu" ? "Re-arm" : "Dwell%",
+                            "TX pwr","Energy","Notes"]
+                            .filter(h => h !== "")
+                            .map(h => (
+                              <th key={h} style={{ padding: "4px 5px", color: "#3a6a3a", textAlign: "left", fontWeight: "normal" }}>{h}</th>
+                            ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {optResults.map((r, i) => {
+                          const isTop = i === 0;
+                          const vsPct = region === "us" ? ((r.toa / 400) * 100).toFixed(0) : null;
+                          const notes = [];
+                          if (r.ldro) notes.push("LDRO");
+                          return (
+                            <tr
+                              key={i}
+                              onClick={() => applyOptResult(r)}
+                              style={{
+                                borderBottom: "1px solid #1a2e1c",
+                                background: isTop ? "#1a3a20" : "transparent",
+                                cursor: "pointer",
+                                transition: "background 0.1s",
+                              }}
+                              onMouseEnter={e => e.currentTarget.style.background = "#1c4020"}
+                              onMouseLeave={e => e.currentTarget.style.background = isTop ? "#1a3a20" : "transparent"}
+                            >
+                              <td style={{ padding: "5px 5px", color: isTop ? "#9fe89f" : "#4a7a4a" }}>
+                                {isTop ? "★1" : `  ${i + 1}`}
+                              </td>
+                              <td style={{ padding: "5px 5px", color: "#8ab88a" }}>SF{r.sf}</td>
+                              <td style={{ padding: "5px 5px", color: "#8ab88a" }}>{r.bw}</td>
+                              <td style={{ padding: "5px 5px", color: "#8ab88a" }}>4:{r.cr + 4}</td>
+                              {region === "eu" && (
+                                <td style={{ padding: "5px 5px", color: "#8ab88a" }}>{r.band?.id ?? "—"}</td>
+                              )}
+                              <td style={{ padding: "5px 5px", color: isTop ? "#9fe89f" : "#8ab88a", fontWeight: isTop ? "bold" : "normal" }}>
+                                {r.toa.toFixed(1)}ms
+                              </td>
+                              <td style={{ padding: "5px 5px", color: "#8ab88a" }}>
+                                {region === "eu"
+                                  ? `${r.rearm_s?.toFixed(3) ?? "—"}s`
+                                  : `${vsPct}%`}
+                              </td>
+                              <td style={{ padding: "5px 5px", color: "#8ab88a" }}>+{r.txPower}</td>
+                              <td style={{ padding: "5px 5px", color: isTop ? "#9fe89f" : "#8ab88a" }}>
+                                {r.energy_mJ.toFixed(2)}mJ
+                              </td>
+                              <td style={{ padding: "5px 5px", color: "#4a7a4a" }}>
+                                {notes.join(" ") || "—"}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    <div style={{ fontSize: "10px", color: "#2d4a30", marginTop: "6px" }}>
+                      SF7 minimum. Each row shows the lowest TX power for that radio config. Click to apply all settings.
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
           </div>
 
         </div>
