@@ -1,0 +1,21 @@
+{
+  "name": "jumbo-shoo-lora-calculator",
+  "version": "2.2.0",
+  "description": "Jumbo Shoo LoRa Airtime Calculator — single-sensor design tool for EU/US compliance",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^7.3.1"
+  }
+}
